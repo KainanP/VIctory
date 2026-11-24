@@ -232,7 +232,7 @@ fn lower(words: &[u32]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &n)?;
     let bytes = dxbc::build(&[]);
     let c = Container::parse(&bytes)?;
-    emit(&c, &n, &p, &st, &io, &res)
+    emit(&c, &n, &p, &st, &io, &res, super::Target::ANY)
 }
 
 /// A test's device, held with the lock that lets one of these tests use the
