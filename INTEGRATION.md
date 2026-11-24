@@ -4,9 +4,9 @@ Open pull requests of Marvisak/VIctory merged together on `main` (`ffe310e`), ea
 
 ## How it was built
 
-MamaLeVrai's [BUNDLE] stack (#1319 → #1402 → #1492 → #1504 → #1511, at their heads of 2026-11-24: #1402 `119b7630`, #1492 `5bbc0985` without #98, #1504 `1d418919`, #1511 `ca601f02`), then #704, #180, #309, #160, the wave64 stack (#223 → #233 → #320 → #439), the GPU bundles #1418, #1426, #1439, then #493 and #431. Every conflict was resolved by hand; each merge commit says what each side did and how they were combined, including the changes git did not flag (signatures changed by one side, tests that would have been nested and never run, behaviour one side undid). Integration-only commits are named as such.
+MamaLeVrai's [BUNDLE] stack (#1319 → #1402 → #1492 → #1504 → #1511, at their heads of 2026-11-24: #1402 `119b7630`, #1492 `5bbc0985` without #98, #1504 `1d418919`, #1511 `ca601f02`), then #704, #180, #309, #160, the wave64 stack (#223 → #233 → #320 → #439), the GPU bundles #1418, #1426, #1439, then #493 and #431, then #334, #346, #1024, #211 and #492 on top of this file's first version. Every conflict was resolved by hand; each merge commit says what each side did and how they were combined, including the changes git did not flag (signatures changed by one side, tests that would have been nested and never run, behaviour one side undid). Integration-only commits are named as such.
 
-This is the third build of the line (`integ/next-v3`). The previous one sat on the bundles' earlier heads, whose #1492 carried #98 (it loses about 30 programs on the title's shaders, zed6000 on #98 and #1247); every merge was replayed on the current #1511 with the same resolutions (git rerere trained on the previous merges, then each result checked against the previous merge commit file by file). Outside the bundles' own changes (#98 gone; #1402's `119b7630` skips two of #306's tests below validator 1.8) the tree is the previous build's.
+This is the third build of the line (`integ/next-v3`). The previous one sat on the bundles' earlier heads, whose #1492 carried #98 (it loses 29 programs on the title's shaders, zed6000 on #98 and #1247); every merge was replayed on the current #1511 with the same resolutions (git rerere trained on the previous merges, then each result checked against the previous merge commit file by file). Outside the bundles' own changes (#98 gone; #1402's `119b7630` skips two of #306's tests below validator 1.8) the tree is the previous build's.
 
 Merge order (first parent):
 
@@ -65,17 +65,25 @@ Merge order (first parent):
 1. `09d5bbd0 Merge #493 onto the GPU bundles (#1439 + #1426 + #1418) + shader stack`
 1. `3703c1d5 Merge #431 onto the GPU bundles (#1439 + #1426 + #1418) + shader stack`
 1. `d398dde3 Merge the wave64 stack line (fc30a7d7: #223, #233, #320, #439) with the GPU line`
+1. `26d5b80c Docs: INTEGRATION.md for the integration branch (PRs, merge order, validation)`
+1. `a6f86332 Merge #334 (host copies of title memory transitioned between shader writes and reads) onto integ/next`
+1. `feb919c7 Merge #346 (indirect rectangle-list draws expanded on the GPU) onto #334 + integ/next`
+1. `b07c6758 Merge #1024 (copy-back writes only the GPU's bytes, marks only unchanged pages current) onto #346 + #334 + integ/next`
+1. `31a600fb Merge #211 (PresentX planes composited; Series S black UI/menus) onto #1024 + #346 + #334 + integ/next`
+1. `967d3aec Merge #492 (R9G9B9E5_SHAREDEXP targets and UAVs made as R16G16B16A16_FLOAT) onto #211 + #1024 + #346 + #334 + integ/next`
 
 ## Validation (Windows 11, RTX 4060 Laptop, 32-lane waves, driver 32.0.16.1047; WARP)
 
-Measured on the previous build of this line (`ead034dc`, the same merges on the bundles' earlier heads, with #98). This rebuild was checked merge by merge with `cargo check --workspace --all-targets --all-features --locked` and against the previous merge commits file by file; the full suite runs at the head of the branch (see the later version of this file).
+Runner `scripts/validate.py` (run `rebuild-v3`), on the last merge (`967d3aec`); this file's commit changes nothing else.
 
 | check | result |
 |---|---|
-| `cargo test --workspace --locked --no-fail-fast` (RTX) | 552 passed, 0 failed |
-| same with `VICTORY_WARP=1` | 551 passed, 1 failed: `emit::valu_tests::v_cndmask_on_an_untracked_mask_tests_this_lanes_bit` (from #1084: it pins a wave size, and with `VICTORY_WARP=1` its "hardware" pass is WARP too, which refuses fixed `WaveSize` pipelines; test harness only) |
-| `cargo test --workspace --all-features` (RTX) | 560 passed (adds the `diagnostics` tests) |
+| `cargo test --workspace --locked --no-fail-fast` (RTX) | 571 passed, 0 failed, 8 ignored |
+| same with `VICTORY_WARP=1` | 570 passed, 1 failed (besides the flaky pool test below): `emit::valu_tests::v_cndmask_on_an_untracked_mask_tests_this_lanes_bit` (from #1084: it pins a wave size, and with `VICTORY_WARP=1` its "hardware" pass is WARP too, which refuses fixed `WaveSize` pipelines; test harness only) |
+| `cargo test --workspace --all-features` (RTX) | 580 passed (adds the `diagnostics` tests) |
 | `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask policy` | clean |
+
+Against the previous build (572 / 571 + 1 / 581): the one test that leaves is #98's `emit::wave::tests::permlane16_reads_the_lanes_own_row`; every other test has the same outcome. The two #306 tests that #1402's `119b7630` skips below validator 1.8 run here (this `dxil.dll` is 1.8 or later). `host::batch::upload_pool_reuses_buffers_and_handles_varying_sizes` (#982, via #1426) can fail when the workspace runs in parallel: it expects the upload buffer it returned to the shared host's pool to come back to it, and another test can take it first. It failed in the runner's WARP pass on `967d3aec` (so that pass read 569 passed, 2 failed) and in one of three `cargo test -p victory-gpu --lib` reruns on WARP; it passes alone (5 of 5) and with `--test-threads=1`. `victory-gpu` is byte-identical to the previous build, so this is not from the rebuild.
 
 After each merge the number of tests that run was checked against the number the PR adds.
 
@@ -87,9 +95,11 @@ After each merge the number of tests that run was checked against the number the
 ## Not included
 
 - #98 (v_permlane16 in whole-wave sections): no longer in bundle #1492; it loses 29 programs on the title's shaders according to zed6000 (#98, #1247).
+- #282 (indirect rectangle-list draws expanded on the CPU, #255): the same draws as #346, which is taken instead (only one can land; the reasons are in the #346 merge commit).
+- #693 (shadow buffers in DEFAULT VRAM with staging readback): incompatible with #1024, which is taken instead; #693 has unfixed in-title regressions (about 2x slower frames on an RX 6700 XT, https://github.com/Marvisak/VIctory/pull/693#issuecomment-7136073380; GPU page faults in freed staging on RX 6950 XT/6700 XT, https://github.com/Marvisak/VIctory/pull/693#issuecomment-7135206500).
 - #306's latest commit (`e3067aea`, after the `93421530b` the bundle carries): not in #1402, so #306 is not listed below although the bundle carries the rest of it.
 
-## Pull requests whose head is contained here (106)
+## Pull requests whose head is contained here (109)
 
 | PR | author | head | via |
 |---|---|---|---|
@@ -112,16 +122,18 @@ After each merge the number of tests that run was checked against the number the
 | #193 | n-romanovich | `f99b792e0` | direct |
 | #202 | ifBars | `dcf666486` | #1426 |
 | #208 | wbkepler | `eb723596b` | #1426 |
+| #211 | Yaekai | `2fb7a8b44` | direct |
 | #223 | r4tedx | `714b81805` | direct |
 | #233 | r4tedx | `ededb1bab` | direct |
-| #251 | tcurtsinger | `f0eddd878` | #1426 |
 | #270 | Maraco91 | `92f2c60c8` | #1418 |
 | #278 | Quat3rnion | `d063cee54` | #1418 |
 | #305 | tarcisioads | `78dae8362` | #1402 |
 | #309 | AntoninMichelq | `64c7188a1` | direct |
 | #320 | r4tedx | `41369c902` | direct |
 | #322 | jsthope | `b58d198d9` | #1426 |
+| #334 | realhenners | `c99e4290b` | direct |
 | #343 | pedrofort | `9459c12d2` | #1511 |
+| #346 | BastienRodz | `8ef6bfea1` | direct |
 | #347 | AugustoZFJ | `197c7acf1` | #1439 |
 | #352 | rhuantac | `f77bd28c6` | #1439 |
 | #358 | Dufftwt | `369dc3246` | #1439 |
@@ -139,6 +151,7 @@ After each merge the number of tests that run was checked against the number the
 | #484 | ToxicmaggotRP | `3b7e1d5f9` | #1418 |
 | #485 | fuzeofficlal | `d454508f7` | #1439 |
 | #488 | enzoduarte1 | `fba33207c` | #1418 |
+| #492 | Yaekai | `c7bb83fd3` | direct |
 | #493 | hophaver | `c48b240ad` | direct |
 | #515 | desplmfao | `d9cb90856` | #1418 |
 | #550 | edsuuu | `8560817ad` | #1439 |
@@ -158,6 +171,7 @@ After each merge the number of tests that run was checked against the number the
 | #1004 | tarcisioads | `cbc8c33dc` | #1319 |
 | #1015 | justrealyme | `b8cfe8ce7` | #1319 |
 | #1021 | CaravelaLabs | `3d71ad1a6` | #1492 |
+| #1024 | Dufftwt | `67125b3a8` | direct |
 | #1032 | divyeshganta | `b38a3c9fa` | #1426 |
 | #1042 | gabrielcruzg3 | `ad330155a` | #1511 |
 | #1048 | LouisRiverstone | `7b57e8e8d` | #1492 |
@@ -165,7 +179,6 @@ After each merge the number of tests that run was checked against the number the
 | #1053 | LouisRiverstone | `393320dfa` | #1492 |
 | #1055 | adamdotpy | `21d1b4682` | #1319 |
 | #1056 | adamdotpy | `417f4e30d` | #1319 |
-| #1057 | bartikele | `a793ad86a` | #1319 |
 | #1067 | undeadhuman37 | `6d30fd71c` | #1402 |
 | #1073 | undeadhuman37 | `986fa6db9` | #1319 |
 | #1074 | undeadhuman37 | `ec337a025` | #1319 |
