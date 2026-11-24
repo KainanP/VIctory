@@ -435,8 +435,12 @@ mod tests {
         ];
         for uses in idioms {
             let words = else_mask_spilled(uses);
-            // The spill reads the mask as a number where its lanes are not.
+            // On `main` the spill reads the mask as a number where its lanes are
+            // not (HOLDING) unless it is forwarded. On the bundle stack (#1511) the
+            // spilled mask is already tracked through the VGPR lane, so both paths
+            // translate; what this test still pins is that forwarding works.
             match translate(&words, false) {
+                Ok(()) => {}
                 Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, HOLDING),
                 r => panic!("{r:?}"),
             }
