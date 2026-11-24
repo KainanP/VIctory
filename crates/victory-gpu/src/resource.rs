@@ -246,6 +246,22 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The format a render target or unordered-access texture of `format` is
+/// made in on the host, and that render target views and pipelines name:
+/// `R16G16B16A16_FLOAT` (10) for `R9G9B9E5_SHAREDEXP` (67), which PC D3D12
+/// forbids as a render target or unordered-access resource; else
+/// [`pc_format`]. Textures only sampled keep `R9G9B9E5_SHAREDEXP`.
+pub(crate) fn target_format(format: u32) -> u32 {
+    const R9G9B9E5_SHAREDEXP: u32 = 67;
+    const RGBA16_FLOAT: u32 = 10;
+    let format = pc_format(format);
+    if format == R9G9B9E5_SHAREDEXP {
+        RGBA16_FLOAT
+    } else {
+        format
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -285,6 +301,12 @@ pub(crate) fn family(format: u32) -> u32 {
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
+/// The original texture format, before host substitutions.
+#[cfg(windows)]
+pub(crate) fn texture_format(this: This) -> u32 {
+    resource(this).desc.format
+}
+
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
@@ -293,7 +315,7 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    (format != own && format != target_format(own)).then_some(own)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -875,7 +897,12 @@ fn host_texture(
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    const RENDER_TARGET: u32 = 1;
+    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        target_format(d.format)
+    } else {
+        pc_format(d.format)
+    };
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -892,7 +919,11 @@ fn host_texture(
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+            target_format(value[0])
+        } else {
+            pc_format(value[0])
+        };
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {
@@ -2026,5 +2057,55 @@ mod tests {
         create(&buffer(256), &mut buf);
         assert_eq!(reported(buf), 1, "buffers have one level");
         assert_eq!(slot::<Release>(buf, 0x10)(buf), 0);
+    }
+
+    #[test]
+    fn r9g9b9e5_target_format_substitutes_rgba16f() {
+        assert_eq!(pc_format(67), 67);
+        assert_eq!(target_format(67), 10);
+        assert_eq!(target_format(28), 28);
+        assert_eq!(target_format(118), 45);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r9g9b9e5_render_target_and_uav_textures_create_on_host() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let tex_desc = |flags: u32| ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 67, // DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        };
+        for (flags, expected_host_format) in [(0, 67), (4, 10), (5, 10)] {
+            let d = tex_desc(flags);
+            let mut out = std::ptr::null();
+            let hr = create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &d,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out,
+            );
+            assert_eq!(hr, S_OK, "flags {flags}");
+            let host = host_resource(out).expect("host texture created");
+            // SAFETY: a live host texture.
+            let got = unsafe { host.GetDesc() }.Format.0 as u32;
+            assert_eq!(got, expected_host_format, "flags {flags}");
+            assert_eq!(view_format(out), None, "flags {flags}");
+            assert_eq!(slot::<Release>(out, 0x10)(out), 0);
+        }
     }
 }
