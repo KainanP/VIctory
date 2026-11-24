@@ -342,7 +342,7 @@ mod tests {
         let io = io::raise(&p, &native)?;
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        crate::emit::emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+        crate::emit::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).map(|_| ())
     }
 
     /// Assembled with llvm-mc (gfx1030, wave64): an `if` whose else-mask
