@@ -211,7 +211,10 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    // #309: SGPRs reloaded from VGPR lanes become the spilled value (rewrites the IR,
+    // so it runs before structurisation and resource tracking).
+    crate::sgpr_spill::forward(&mut p);
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
