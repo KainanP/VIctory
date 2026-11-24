@@ -90,6 +90,7 @@ impl RawWindow {
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
+    pub const TILED_RESOURCES: u64 = 1 << 12;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
@@ -154,6 +155,9 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Compute shader uses SM 6.6 implicit-derivative ops (`dx.valver` 1.8).
     pub cs_derivatives: bool,
+    /// A sample passes a level clamp (`_cl`), which validator 1.8 counts as
+    /// tiled-resource use (an earlier validator does not).
+    pub lod_clamp: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -209,6 +213,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             cs_derivatives: false,
+            lod_clamp: false,
             lds_dwords: 0,
             lds: None,
             main,
@@ -609,6 +614,11 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        // A level clamp on a sample is tiled-resource use for validator 1.8
+        // (`dx.valver` below), not for the 1.6 declared otherwise.
+        if self.lod_clamp && self.cs_derivatives {
+            self.flags |= flags::TILED_RESOURCES;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -695,6 +705,9 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
+        }
+        if self.flags & flags::TILED_RESOURCES != 0 {
+            features |= 0x100;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
