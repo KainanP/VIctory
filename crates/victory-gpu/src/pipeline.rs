@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 #[cfg(windows)]
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(all(windows, feature = "diagnostics"))]
+use std::sync::Mutex;
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -74,12 +76,21 @@ impl std::fmt::Debug for Shader {
 }
 
 /// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+static SHADERS: std::sync::RwLock<Option<HashMap<[u8; 32], Arc<Shader>>>> =
+    std::sync::RwLock::new(None);
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
-    let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = SHADERS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(full.as_bytes()))
+    {
+        return s.clone();
+    }
+    let mut shaders = SHADERS.write().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())

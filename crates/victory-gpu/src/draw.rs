@@ -207,7 +207,7 @@ pub(crate) fn dispatched() -> u64 {
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
 fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = list.find_shadow(address, 1)?;
     let len = shadow
         .left(address)
         .min(if srv || uav { 1 << 20 } else { 1 << 16 });
@@ -558,7 +558,7 @@ impl State {
             if v.address == 0 || v.size == 0 {
                 continue;
             }
-            let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+            let Some(shadow) = list.find_shadow(v.address, u64::from(v.size)) else {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -576,7 +576,7 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+            let Some(shadow) = list.find_shadow(v.address, u64::from(v.size)) else {
                 not_run("index buffer outside title buffers");
                 return false;
             };
@@ -1239,7 +1239,7 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        if let Some(view) = host.mirror_cached(list, index, handle) {
             readable(list, u, &view, true);
         }
     }
@@ -1319,7 +1319,7 @@ impl State {
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
+                    if let Some(view) = list.lookup_view(handle) {
                         readable(list, u, &view, true);
                     }
                 }
@@ -1343,7 +1343,7 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                match list.lookup_view(table + u64::from(k) * 32) {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
@@ -1623,7 +1623,7 @@ impl State {
             if v.address == 0
                 || stride == 0
                 || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
+                || list.find_shadow(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
@@ -1738,12 +1738,12 @@ impl State {
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
-        let Some(args) = crate::shadow::find(arguments, len) else {
+        let Some(args) = list.find_shadow(arguments, len) else {
             why("arguments outside title buffers");
             return false;
         };
         let counter = match count {
-            Some(at) => match crate::shadow::find(at, 4) {
+            Some(at) => match list.find_shadow(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
@@ -1843,9 +1843,15 @@ impl State {
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    static MADE: std::sync::RwLock<Vec<((u32, u32), ID3D12CommandSignature)>> =
+        std::sync::RwLock::new(Vec::new());
+    {
+        let made = MADE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+            return Some(s.clone());
+        }
+    }
+    let mut made = MADE.write().unwrap_or_else(|e| e.into_inner());
     if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
         return Some(s.clone());
     }
@@ -1891,9 +1897,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     // Constant buffers (raw views) to their copy's end at most; others in
     // the copy their host view reads.
     let range = match *view {
-        View::Constant(address, size) => crate::shadow::find(address, 1).and_then(|s| {
+        View::Constant(address, size) => list.find_shadow(address, 1).and_then(|s| {
             let len = u64::from(size).min(s.left(address));
-            crate::shadow::find(address, len).map(|s| (s, address, len))
+            list.find_shadow(address, len).map(|s| (s, address, len))
         }),
         _ => crate::descriptor::host::view_copy(view),
     };
