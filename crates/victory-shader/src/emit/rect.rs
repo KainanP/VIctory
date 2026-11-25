@@ -224,6 +224,80 @@ mod tests {
         s.finish()
     }
 
+    /// #2621: a constant branch whose taken side is an empty block that
+    /// folds into the other target. The phi in `join` must keep one entry
+    /// (0.25, through `taken`), not also the untaken direct edge's 0.75.
+    /// Checked with the DXIL validator and by drawing on the hardware
+    /// adapter and on WARP (shape from andrewpozdnakov7-jpg's 0e74a15,
+    /// extended to the hardware adapter).
+    #[test]
+    fn repro_2621_folded_constant_branch_keeps_one_phi_entry() {
+        let mut s = Shader::new(true);
+        let entry = s.entry;
+        let taken = s.m.new_block();
+        let join = s.m.new_block();
+        let condition = s.m.bool(true);
+        let selected = s.m.f32(0.25f32.to_bits());
+        let discarded = s.m.f32(0.75f32.to_bits());
+        s.m.terminate(entry, Term::CondBr(condition, taken, join));
+        s.m.terminate(taken, Term::Br(join));
+        let red = s.m.phi(join, s.t.f32);
+        s.m.set_phi(red, vec![(selected, taken), (discarded, entry)]);
+        s.outputs.push(element("SV_Target", 16, 0, 0, 4));
+        let zero = s.m.f32(0);
+        let one = s.m.f32(1f32.to_bits());
+        for (col, value) in [red, zero, zero, one].into_iter().enumerate() {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col as u8), value];
+            s.op(join, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.m.terminate(join, Term::Ret);
+        let ps = s.finish();
+        let mut bad = Vec::new();
+        let path = super::super::validator::Validator::default_path();
+        match super::super::validator::Validator::load(path.as_deref()) {
+            Ok(mut validator) => match validator.validate(&mut ps.clone()) {
+                Ok(()) => eprintln!("REPRO2621 validator: ok"),
+                Err(e) => {
+                    eprintln!("REPRO2621 validator: {e}");
+                    bad.push(format!("validator: {e}"));
+                }
+            },
+            Err(e) => eprintln!("REPRO2621 no DXIL validator ({e})"),
+        }
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("REPRO2621 warp={warp}: no device");
+                continue;
+            };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = match host.pipeline_with(&root, &shader(false), &ps) {
+                Ok(pso) => pso,
+                Err(e) => {
+                    eprintln!("REPRO2621 warp={warp}: pipeline refused: {e}");
+                    bad.push(format!("warp={warp}: pipeline refused: {e}"));
+                    continue;
+                }
+            };
+            let vertex = |x, y| [x, y, 0.5, 1.0, 0.0, 0.0];
+            let vertices = [vertex(-1.0, -1.0), vertex(-1.0, 3.0), vertex(3.0, -1.0)].concat();
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: &vertices,
+                stride: 24,
+                size: (2, 2),
+                mesh_groups: 0,
+            };
+            let texels = host.draw(&root, &pso, &draw).unwrap();
+            eprintln!("REPRO2621 warp={warp}: texels {:?}", texels[0]);
+            if texels != [[0.25, 0.0, 0.0, 1.0]; 4] {
+                bad.push(format!("warp={warp}: drew {texels:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
     /// One rectangle with a coordinate attribute, its right angle at each of
     /// the three corners in turn (the blits' top left, bottom left, bottom
     /// right; the tiled lighting's top left, bottom left, top right; and
