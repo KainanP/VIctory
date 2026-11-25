@@ -2286,6 +2286,144 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
 
+    /// The host's format support bits (`D3D12_FORMAT_SUPPORT1`) for `format`.
+    #[cfg(windows)]
+    fn host_support(format: u32) -> u32 {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let host = crate::host::host().expect("a host");
+        let mut s = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT(format as i32), ..Default::default() };
+        // SAFETY: a plain query into a struct of its size.
+        unsafe { host.device.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut s).cast(), size_of_val(&s) as u32) }
+            .expect("format support");
+        s.Support1.0 as u32
+    }
+
+    /// The host device is alive, and (diagnostics builds with
+    /// `VICTORY_D3D12_DEBUG=1`) the debug layer reported no error.
+    #[cfg(windows)]
+    fn host_device_is_fine(what: &str) {
+        let host = crate::host::host().expect("a host");
+        let debug = host.log_messages();
+        // SAFETY: a plain device query.
+        let removed = unsafe { host.device.GetDeviceRemovedReason() };
+        assert!(removed.is_ok(), "{what}: host device removed ({removed:?}); debug layer: {debug:?}");
+        assert!(debug.is_none(), "{what}: debug layer error: {debug:?}");
+    }
+
+    /// #1753 (a): a B5G5R5A1_UNORM (86) title texture asking for unordered
+    /// access, on a host that has no typed unordered access in that format
+    /// (NVIDIA and Intel report none): it gets a host texture, a second
+    /// title texture of the same memory shares it, and its unordered view
+    /// (in its own format, and without a description) leaves the host
+    /// device alive and the debug layer quiet. Hosts that store to the
+    /// format (WARP) pass trivially.
+    #[cfg(windows)]
+    #[test]
+    fn nvidia_1753_b5g5r5a1_texture_asking_for_unordered_access() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = |desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(create_placed(null, h, 0, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+            out
+        };
+        let typed_uav = host_support(86) & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 as u32 != 0;
+        let written = place(&ResourceDesc { flags: UNORDERED, ..texture(64, 64, 86, 1) });
+        let copy = host_copy(written).expect("(a) a host texture for a B5G5R5A1 texture asking for unordered access");
+        host_device_is_fine("(a) after the host texture");
+        // A second title texture of the memory: shared (its allocation size asked).
+        let again = place(&ResourceDesc { flags: UNORDERED, ..texture(64, 64, 86, 1) });
+        let shared = host_copy(again).expect("(a) the second title texture's host texture");
+        host_device_is_fine("(a) after sharing");
+        // SAFETY: live resources.
+        let d = unsafe { copy.texture.GetDesc() };
+        let mut uav = [0u32; 10];
+        uav[..2].copy_from_slice(&[86, 4]); // B5G5R5A1, TEXTURE2D
+        eprintln!("REPRO(a) next: an unordered view in B5G5R5A1");
+        let own = crate::descriptor::host::make_view(&crate::descriptor::View::Unordered(written as usize, 0, Some(uav)), host.cpu_view());
+        host_device_is_fine("(a) after an unordered view in B5G5R5A1");
+        // On an RTX 4060 this view, if made, is an access violation in the
+        // process rather than a device removal.
+        eprintln!("REPRO(a) next: an unordered view without a description");
+        let plain = crate::descriptor::host::make_view(&crate::descriptor::View::Unordered(written as usize, 0, None), host.cpu_view());
+        host_device_is_fine("(a) after an unordered view without a description");
+        eprintln!(
+            "REPRO(a) host typed UAV of 86: {typed_uav}; host texture format {} flags {:#x}; shared {}; UAV in 86 made: {}; UAV without description made: {}",
+            d.Format.0,
+            d.Flags.0,
+            std::sync::Arc::ptr_eq(&copy, &shared),
+            own.is_some(),
+            plain.is_some()
+        );
+        drop((copy, shared));
+        for r in [written, again] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// #1753 (b): a B4G4R4A4_UNORM (115) colour target, on a host that does
+    /// not render to that format (NVIDIA reports no render target): the
+    /// title's render target view of it, bound as a draw binds it
+    /// (`draw::State::set_targets`), leaves the host device alive and the
+    /// debug layer quiet, and the host texture is one the host renders to
+    /// (else the title's draws to it are lost).
+    #[cfg(windows)]
+    #[test]
+    fn nvidia_1753_b4g4r4a4_colour_target() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let mut target = null;
+        let desc = ResourceDesc { flags: 1, ..texture(64, 64, 115, 1) };
+        assert_eq!(create_placed(null, h, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut target), S_OK);
+        let renders = host_support(115) & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32 != 0;
+        // The title's view: B4G4R4A4, 2D, in descriptor memory of its own.
+        let memory = vec![0u64; 16];
+        let handle = memory.as_ptr() as u64;
+        crate::descriptor::create_rtv(null, target, &[115, 4, 0, 0, 0, 0], handle);
+        let record = crate::descriptor::rtv_record(handle).expect("the title's view");
+        let made = host_resource(target);
+        host_device_is_fine("(b) after the host texture");
+        let texture = made.expect("(b) a host texture for a B4G4R4A4 colour target");
+        let view = record.desc();
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        // A host texture without the render-target use gets no view (a fix
+        // may skip such targets in `set_targets`); the assertion below says
+        // its draws are lost.
+        if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0 {
+            let _ = host.rtv(&texture, view.as_ref());
+            host_device_is_fine("(b) after the title's render target view");
+        }
+        let viewed = view.map_or(d.Format.0 as u32, |v| v.Format.0 as u32);
+        eprintln!(
+            "REPRO(b) host renders to 115: {renders}; host texture format {} flags {:#x}; view format {viewed}",
+            d.Format.0, d.Flags.0
+        );
+        assert_ne!(
+            d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0,
+            0,
+            "(b) the host texture of a colour target cannot be rendered to: its draws are lost"
+        );
+        assert_ne!(
+            host_support(viewed) & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32,
+            0,
+            "(b) the render target view's format {viewed} is not one the host renders to"
+        );
+        drop(texture);
+        assert_eq!(slot::<Release>(target, 0x10)(target), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
     #[test]
     fn a_regions_rows_in_a_footprint() {
         // R32_FLOAT (41) 100x8x1, pitch 512.
