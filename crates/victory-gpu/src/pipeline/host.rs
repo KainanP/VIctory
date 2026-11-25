@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{HostShader, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -370,6 +370,10 @@ impl HostPipeline {
                 shaders,
             );
         }
+        let linked = match stages.as_slice() {
+            [(ms, _), (ps, _)] if mesh.is_some() => linked(ms, ps),
+            _ => None,
+        };
 
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
         // SAFETY: the feature query writes the structure of the given size.
@@ -518,13 +522,17 @@ impl HostPipeline {
             }
         };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+            let linked = linked.as_ref().map(|(ms, ps)| if i == 0 { ms } else { ps });
+            stages
+                .get(i)
+                .and_then(|(s, _)| s.translated())
+                .map(|t| linked.unwrap_or(&t.host))
+                .map_or(D3D12_SHADER_BYTECODE::default(), |h| {
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: h.dxil.as_ptr().cast(),
+                        BytecodeLength: h.dxil.len(),
+                    }
+                })
         };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -750,6 +758,41 @@ fn mesh_pipeline(
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
     )
+}
+
+/// A mesh program whose outputs pass D3D12's 32 KiB (the validator refuses
+/// it; drivers may take it and misbehave) and its pixel program, re-emitted
+/// for each other without the values the pixel program never reads
+/// ([`victory_shader::emit::translate_linked`]). `None` when the mesh
+/// program fits, or the pair cannot be linked with the bindings the root
+/// signature is made from.
+fn linked(ms: &Arc<Shader>, ps: &Arc<Shader>) -> Option<(HostShader, HostShader)> {
+    let (m, p) = (&ms.translated()?.host, &ps.translated()?.host);
+    let same = |a: &HostShader, b: &HostShader| {
+        a.user_data == b.user_data
+            && a.samplers == b.samplers
+            && a.root_cbvs == b.root_cbvs
+            && a.root_srvs == b.root_srvs
+            && a.root_uavs == b.root_uavs
+            && (a.memory, a.memory_writes, a.view_addresses) == (b.memory, b.memory_writes, b.view_addresses)
+            && (a.heap, a.heap_writes, a.view_marks) == (b.heap, b.heap_writes, b.view_marks)
+    };
+    let options = crate::shader_cache::OPTIONS;
+    match victory_shader::emit::translate_linked(&ms.container, &ps.container, &p.dxil, options) {
+        Ok(None) => None,
+        Ok(Some((lm, lp))) if same(&lm, m) && same(&lp, p) => {
+            tracing::info!(shaders = ?[ms, ps], "mesh outputs past 32 KiB: linked to the pixel shader");
+            Some((lm, lp))
+        }
+        Ok(Some(_)) => {
+            tracing::warn!(shaders = ?[ms, ps], "mesh outputs past 32 KiB: linked shaders bind differently, kept as they are");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(shaders = ?[ms, ps], error = %e, "mesh outputs past 32 KiB: not linked");
+            None
+        }
+    }
 }
 
 /// The bytes of shader code (none for an absent stage).
