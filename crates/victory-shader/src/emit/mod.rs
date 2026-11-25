@@ -2104,4 +2104,311 @@ mod tests {
             }
         }
     }
+
+    /// Value `c` of parameter `n` in [`a_linked_pair_draws_what_the_pixel_program_reads`].
+    fn param_value(n: u8, c: u8) -> f32 {
+        f32::from(n + 1) + f32::from(c) * 0.25
+    }
+
+    /// `native` emitted with the signatures of `bytes`, pruned to `keep`
+    /// when given (as [`translate_linked`] does).
+    fn emitted_pruned(
+        bytes: &[u8],
+        native: &NativeProgram,
+        keep: Option<&lower::KeptOutputs>,
+    ) -> Result<HostShader, ShaderError> {
+        let c = Container::parse(bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, native)?;
+        let input = EmitInput {
+            c: &c,
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+        };
+        emit_pruned(&input, Options::default(), keep)
+    }
+
+    /// A mesh program of 128 lanes (wave32) declaring 128 vertices and
+    /// primitives: every lane exports primitive (0, 1, 2), lanes 0-2 the
+    /// corners covering the target, and each lane the 16 parameters
+    /// ([`param_value`], every component a different value) into
+    /// `TEXCOORD1-16` (rows 1-16) after the position: 68 components,
+    /// 34,816 bytes at 128 vertices, past 32 KiB at the lane count.
+    fn over_budget_mesh() -> (Vec<u8>, NativeProgram) {
+        use crate::native::{MeshIo, Usage, VsOutput};
+        let mut words: Vec<u32> = vec![
+            0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
+            TRIANGLE,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+        ];
+        let mut outputs = Vec::new();
+        for n in 0..16u8 {
+            for c in 0..4u8 {
+                // v_mov_b32 v(10 + c), param_value(n, c)
+                words.extend([
+                    0x7E00_02FF | u32::from(10 + c) << 17,
+                    param_value(n, c).to_bits(),
+                ]);
+            }
+            // exp param<n> v10, v11, v12, v13
+            words.extend([0xF800_000F | (32 + u32::from(n)) << 4, 0x0D0C_0B0A]);
+            outputs.push(VsOutput {
+                usage: Usage::Generic,
+                row: n + 1,
+                param: n,
+                fp16: false,
+                pack2: false,
+            });
+        }
+        words.extend([
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xBF81_0000, // s_endpgm
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs,
+                clip_cntl: 0,
+                threads: 128,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let element = |name: &str, row: u32, kind: u8| SigElement {
+            name: name.into(),
+            index: if kind == 0 { row } else { 0 },
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let mut vertex = vec![element("SV_Position", 0, 3)];
+        vertex.extend((1..=16).map(|r| element("TEXCOORD", r, 0)));
+        let osg1 = container::signature(&vertex, false);
+        (crate::dxbc::build(&[(FourCC::OSG1, &osg1)]), native)
+    }
+
+    /// A pixel program declaring `TEXCOORD1`, 15 and 16 (rows 1, 15, 16;
+    /// parameters 0, 14, 15) and writing (`TEXCOORD1.x`, `TEXCOORD1.w`,
+    /// `TEXCOORD15.y`, 1): two channels of one row with the two between them
+    /// unread, one channel in the middle of another, and `TEXCOORD16`
+    /// declared but never read.
+    fn texcoord_pixel() -> (Vec<u8>, NativeProgram) {
+        use crate::native::{PsInput, Usage};
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0xC80C_0300,    // v_interp_p1_f32 v3, v0, attr0.w
+            0xC80D_0301,    // v_interp_p2_f32 v3, v1, attr0.w
+            0xC810_3900,    // v_interp_p1_f32 v4, v0, attr14.y
+            0xC811_3901,    // v_interp_p2_f32 v4, v1, attr14.y
+            0x7E0A_02F2,    // v_mov_b32 v5, 1.0
+            0xF800_180F,    // exp mrt0 v2, v3, v4, v5 done vm
+            0x0504_0302,
+            0xBF81_0000, // s_endpgm
+        ];
+        let input = |row: u8, attr: u8| PsInput {
+            usage: Usage::Generic,
+            row,
+            mask: 0xF,
+            attr,
+            flat: false,
+            fp16: false,
+            pack2: false,
+            row2: 0,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![input(1, 0), input(15, 14), input(16, 15)],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let element = |name: &str, row: u32, kind: u8, usage: u8| SigElement {
+            name: name.into(),
+            index: if kind == 0 { row } else { 0 },
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage,
+            half: false,
+        };
+        let isg1 = container::signature(&[1, 15, 16].map(|r| element("TEXCOORD", r, 0, 0)), true);
+        let osg1 = container::signature(&[element("SV_Target", 0, 16, 15)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        (bytes, native)
+    }
+
+    /// A mesh program whose outputs pass 32 KiB at one vertex per lane (on
+    /// its own dxil.dll refuses it: "vertex plus primitive output size is
+    /// greater than 32768"), linked to a pixel program that reads 3 of its
+    /// 64 parameter components, two of them in one row with a gap between
+    /// them, and declares a row it never reads: what the pixel program reads
+    /// is kept (`TEXCOORD1` whole, `TEXCOORD15.y` alone), the rest leaves
+    /// both signatures (`TEXCOORD16` included), both modules validate, and
+    /// on the host GPU and WARP (where they have mesh shaders) every texel
+    /// holds the exact parameter components the pixel program reads.
+    #[test]
+    fn a_linked_pair_draws_what_the_pixel_program_reads() {
+        let (ms_bytes, ms_native) = over_budget_mesh();
+        let (ps_bytes, ps_native) = texcoord_pixel();
+        let validated = |dxil: &[u8]| -> Option<Result<(), String>> {
+            #[cfg(windows)]
+            {
+                let path = super::validator::Validator::default_path();
+                let mut v = super::validator::Validator::load(path.as_deref()).ok()?;
+                Some(v.validate(&mut dxil.to_vec()))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = dxil;
+                None
+            }
+        };
+        let declared = |dxil: &[u8], part| -> Vec<(String, u32, u8, u8)> {
+            let c = Container::parse(dxil).unwrap();
+            signature(c.part(part).unwrap().data)
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.index, e.col, e.cols))
+                .collect()
+        };
+        let t = |index: u32, col: u8, cols: u8| ("TEXCOORD".to_owned(), index, col, cols);
+
+        let plain = emitted_pruned(&ms_bytes, &ms_native, None).unwrap();
+        assert_eq!(mesh_output_bytes(&plain.dxil), Some(68 * 4 * 128));
+        if let Some(r) = validated(&plain.dxil) {
+            let e = r.expect_err("the unlinked mesh program fits in 32 KiB");
+            assert!(e.contains("greater than 32768"), "{e}");
+        }
+        let ps_plain = emitted_pruned(&ps_bytes, &ps_native, None).unwrap();
+        assert_eq!(
+            declared(&ps_plain.dxil, FourCC::ISG1),
+            [t(1, 0, 4), t(15, 0, 4), t(16, 0, 4)]
+        );
+        let reads = pixel_input_reads(&ps_plain.dxil).unwrap();
+        assert_eq!(
+            reads,
+            lower::KeptOutputs::from([
+                (("TEXCOORD".to_owned(), 1), 0b1001),
+                (("TEXCOORD".to_owned(), 15), 0b0010),
+            ])
+        );
+
+        let ms = emitted_pruned(&ms_bytes, &ms_native, Some(&reads)).unwrap();
+        let ps = emitted_pruned(&ps_bytes, &ps_native, Some(&reads)).unwrap();
+        assert_eq!(
+            declared(&ms.dxil, FourCC::OSG1),
+            [("SV_Position".to_owned(), 0, 0, 4), t(1, 0, 4), t(15, 1, 1)]
+        );
+        assert_eq!(declared(&ps.dxil, FourCC::ISG1), [t(1, 0, 4), t(15, 1, 1)]);
+        assert_eq!(mesh_output_bytes(&ms.dxil), Some((4 + 4 + 1) * 4 * 128));
+        for s in [&ms, &ps] {
+            if let Some(r) = validated(&s.dxil) {
+                r.unwrap();
+            }
+        }
+        #[cfg(windows)]
+        {
+            use super::host::{Draw, Host, Root};
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+                D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
+            };
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let want = [
+                param_value(0, 0),
+                param_value(0, 3),
+                param_value(14, 1),
+                1.0,
+            ];
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {label} device; skipped");
+                    continue;
+                };
+                let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+                // SAFETY: the query writes the structure of the given size.
+                let queried = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS7,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                };
+                if queried.is_err()
+                    || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+                {
+                    eprintln!("no mesh shaders on the {label} device; skipped");
+                    continue;
+                }
+                let (root, pso) = host
+                    .mesh_pipeline(&ms, &ps)
+                    .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![
+                                (0, Root::Constants(vec![0])),
+                                (1, Root::Constants(vec![0])),
+                            ],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                let right = texels.iter().filter(|t| **t == want).count();
+                assert_eq!(right, texels.len(), "{label}: {:?}", texels[0]);
+                eprintln!("{label}: the linked pair drew {right} texels");
+            }
+        }
+    }
 }
