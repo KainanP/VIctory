@@ -754,7 +754,7 @@ impl State {
                         && u.dword == 0
                         && let Some(Root::View(address)) =
                             self.roots_ref(compute).get(usize::from(u.slot))
-                        && let Some(shadow) = crate::shadow::find(*address, 1)
+                        && let Some(shadow) = list.find_shadow(*address, 1)
                     {
                         let uav = t.used.iter().any(|r| {
                             r.slot == u.slot
@@ -771,7 +771,7 @@ impl State {
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
+                                Some(&Root::View(address)) => list.find_shadow(address, 1)
                                     .and_then(|s| u32::try_from(s.offset(address)).ok()),
                                 _ => None,
                             };
@@ -925,7 +925,7 @@ impl State {
             not_run("a root view the title did not set");
             return None;
         };
-        let Some(shadow) = crate::shadow::find(address, 1) else {
+        let Some(shadow) = list.find_shadow(address, 1) else {
             not_run("a root view outside title buffers");
             return None;
         };
