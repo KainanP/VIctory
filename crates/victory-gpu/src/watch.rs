@@ -217,6 +217,14 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 
 #[cfg(not(feature = "diagnostics"))]
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
+    #[cfg(test)]
+    if let Err(std::sync::TryLockError::WouldBlock) = GUARDS.try_lock() {
+        // Timed for the benchmark when it is taken.
+        let started = std::time::Instant::now();
+        let held = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+        tests::WAITED.set(tests::WAITED.get() + started.elapsed().as_micros() as u64);
+        return held;
+    }
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -1445,5 +1453,399 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    thread_local! {
+        /// Microseconds this thread waited for the guard lock (test builds
+        /// without diagnostics: [`guards`] times a lock it finds taken).
+        pub(crate) static WAITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A host copy of tracked memory as `crate::shadow` keeps one: what
+    /// [`Tracked::take`] answers, read from title memory into `side`.
+    struct Copy {
+        tracked: Tracked,
+        start: usize,
+        side: Vec<u64>,
+    }
+
+    impl Copy {
+        fn new(start: usize, pages: usize) -> Copy {
+            Copy {
+                tracked: track(start, pages * PAGE, true).expect("tracked"),
+                start,
+                side: vec![0; pages * PAGE / 8],
+            }
+        }
+
+        fn end(&self) -> usize {
+            self.start + self.side.len() * 8
+        }
+
+        /// Takes what changed and copies it; the bytes copied.
+        fn refresh(&mut self) -> usize {
+            let mut bytes = 0;
+            for (a, b) in self.tracked.take(self.start, self.end()) {
+                for at in (a..b).step_by(8) {
+                    // SAFETY: tracked title memory of the test, mapped;
+                    // read-only or not, it reads. Written by other threads
+                    // meanwhile: a word at a time, as they write.
+                    self.side[(at - self.start) / 8] =
+                        unsafe { (at as *const u64).read_volatile() };
+                }
+                bytes += b - a;
+            }
+            bytes
+        }
+
+        /// The word at title address `at` in the copy, if it covers it.
+        fn word(&self, at: usize) -> Option<u64> {
+            (self.start..self.end())
+                .contains(&at)
+                .then(|| self.side[(at - self.start) / 8])
+        }
+    }
+
+    /// Refreshes `copies`, each on its own thread, all starting together.
+    fn refresh_together(copies: &mut [Copy]) {
+        let start = std::sync::Barrier::new(copies.len());
+        std::thread::scope(|s| {
+            for copy in copies.iter_mut() {
+                let start = &start;
+                s.spawn(move || {
+                    start.wait();
+                    copy.refresh();
+                });
+            }
+        });
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// Sets its flag when dropped (the writers stop however a test ends).
+    struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Copies refreshed together while the title's threads write lose no
+    /// write: every word written before a refresh began is in every copy
+    /// covering it once it has returned, and the quiet refresh after it
+    /// leaves every copy equal to title memory. Overlapping copies of a
+    /// pool's pages, and copies of both mappings of twin pages (a write at
+    /// one mapping must reach copies of the other).
+    #[test]
+    fn refreshes_under_writes_lose_nothing() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Acquire, Ordering::Release};
+        const POOL: usize = 24;
+        const TWIN: usize = 24;
+        const WRITERS: usize = 4;
+        const SLOTS: usize = 96;
+        let rounds = std::env::var("LOSE_NOTHING_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        let p = pool(POOL);
+        let (a, b) = twin_views(TWIN);
+        // Slot `k`: a word on page `k % (POOL + TWIN)` (the pool's, then
+        // the twin pages'), at an offset of its own. Its address as the
+        // copies of the first mapping see it, and the second mapping's.
+        let slot = |k: usize| {
+            let (page, offset) = (k % (POOL + TWIN), 8 * (k / (POOL + TWIN)) + 64);
+            if page < POOL {
+                (p + page * PAGE + offset, None)
+            } else {
+                let at = (page - POOL) * PAGE + offset;
+                (a + at, Some(b + at))
+            }
+        };
+        // The latest number each writer stored, and each slot's.
+        let latest: Vec<AtomicU64> = (0..WRITERS).map(|_| AtomicU64::new(0)).collect();
+        let written: Vec<AtomicU64> = (0..WRITERS * SLOTS).map(|_| AtomicU64::new(0)).collect();
+        let mut copies = vec![
+            Copy::new(p, POOL),
+            Copy::new(p + 4 * PAGE, POOL - 4),
+            Copy::new(a, TWIN),
+            Copy::new(b, TWIN),
+            Copy::new(b + 8 * PAGE, TWIN - 8),
+        ];
+        refresh_together(&mut copies);
+        for round in 0..rounds {
+            let stop = AtomicBool::new(false);
+            // The writers write a while, and on through the refresh.
+            let begun = std::sync::Barrier::new(WRITERS + 1);
+            let (floor, ceiling) = std::thread::scope(|s| {
+                for w in 0..WRITERS {
+                    let (stop, begun, latest, written) = (&stop, &begun, &latest[w], &written);
+                    s.spawn(move || {
+                        let mut rng = Rng(0x5eed + (w * 1000 + round) as u64);
+                        let mut n = latest.load(Ordering::Relaxed);
+                        for i in 0.. {
+                            if i == 64 {
+                                begun.wait();
+                            }
+                            if i > 64 && stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            n += 1;
+                            let k = w * SLOTS + rng.next() as usize % SLOTS;
+                            let (at, other) = slot(k);
+                            let at = match other {
+                                Some(other) if rng.next().is_multiple_of(2) => other,
+                                _ => at,
+                            };
+                            latest.store(n, Release);
+                            // SAFETY: a word of the test's title memory;
+                            // a guarded page faults into the handler.
+                            unsafe { (at as *mut u64).write_volatile(n) };
+                            // After the store: a refresh that reads this
+                            // number before it begins finds it stored.
+                            written[k].store(n, Release);
+                        }
+                    });
+                }
+                let _stop = Stop(&stop);
+                begun.wait();
+                let floor: Vec<u64> = written.iter().map(|v| v.load(Acquire)).collect();
+                refresh_together(&mut copies);
+                let ceiling: Vec<u64> = latest.iter().map(|v| v.load(Acquire)).collect();
+                (floor, ceiling)
+            });
+            for (c, copy) in copies.iter().enumerate() {
+                for (k, &floor) in floor.iter().enumerate() {
+                    let (at, other) = slot(k);
+                    let Some(value) = copy.word(at).or_else(|| copy.word(other?)) else {
+                        continue;
+                    };
+                    assert!(
+                        value >= floor,
+                        "round {round}: copy {c} lost a write at {at:#x}: holds {value}, {floor} was written before the refresh"
+                    );
+                    assert!(
+                        value <= ceiling[k / SLOTS],
+                        "round {round}: copy {c} holds {value} at {at:#x}, never written"
+                    );
+                }
+            }
+            // The writers are done: a refresh now finds every write.
+            refresh_together(&mut copies);
+            for (c, copy) in copies.iter().enumerate() {
+                // SAFETY: the copy's title memory, mapped.
+                let now = unsafe {
+                    std::slice::from_raw_parts(copy.start as *const u64, copy.side.len())
+                };
+                if let Some(i) = (0..now.len()).find(|&i| copy.side[i] != now[i]) {
+                    panic!(
+                        "round {round}: copy {c} holds {} at {:#x} after a quiet refresh, title memory {}",
+                        copy.side[i],
+                        copy.start + 8 * i,
+                        now[i]
+                    );
+                }
+            }
+        }
+        drop(copies);
+        free(p);
+    }
+
+    fn env(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    }
+
+    /// The guard-lock contention benchmark (`cargo test -p victory-gpu
+    /// --release --lib guard_contention -- --ignored --nocapture`): host
+    /// copies of a write-watched pool refreshed (taken and copied) while the
+    /// title's threads write it, as a submission refreshes its buffers
+    /// (#3425). What a refresh takes, what the writers spend in their writes
+    /// (the write-fault handler, and its wait for the guard lock), and what
+    /// the refresh waits for the lock. Sizes by the environment:
+    /// `BENCH_PAGES` (title memory in 64 KiB pages, 4,096 = 256 MB),
+    /// `BENCH_SPAN` (pages a copy, 32), `BENCH_DIRTY` (pages written before
+    /// each refresh, 1,400, about 89 MB), `BENCH_WRITERS` (title threads,
+    /// 4), `BENCH_GAP_US` (a writer's pause between writes during the
+    /// refresh, 20), `BENCH_ROUNDS` (11, after one not counted),
+    /// `BENCH_WIDE` (1: the copies refreshed on 4 threads), `BENCH_ALIASED`
+    /// (1: the memory shown at two mappings, linked as the runtime links
+    /// them), `BENCH_ARMED` (1: every copy armed, so first writes save the
+    /// page's bytes). Prints the medians, and a `guard_contention:` line of
+    /// them for scripts.
+    #[test]
+    #[ignore = "benchmark: run by hand on a quiet machine"]
+    fn guard_contention() {
+        use std::sync::atomic::AtomicBool;
+        let pages = env("BENCH_PAGES", 4096);
+        let span = env("BENCH_SPAN", 32);
+        let dirty = env("BENCH_DIRTY", 1400).min(pages);
+        let writers = env("BENCH_WRITERS", 4);
+        let gap = env("BENCH_GAP_US", 20) as u64;
+        let rounds = env("BENCH_ROUNDS", 11);
+        let wide = env("BENCH_WIDE", 0) == 1;
+        let aliased = env("BENCH_ALIASED", 0) == 1;
+        let armed = env("BENCH_ARMED", 0) == 1;
+        let at = if aliased {
+            twin_views(pages).0
+        } else {
+            pool(pages)
+        };
+        let len = pages * PAGE;
+        let mut copies: Vec<Copy> = (0..pages)
+            .step_by(span)
+            .map(|first| Copy::new(at + first * PAGE, span.min(pages - first)))
+            .collect();
+        // The bytes copied, and the microseconds waited for the guard lock.
+        let refresh = |copies: &mut [Copy]| -> (usize, u64) {
+            let per = copies.len().div_ceil(if wide { 4 } else { 1 });
+            std::thread::scope(|s| {
+                let handles: Vec<_> = copies
+                    .chunks_mut(per)
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            let bytes = chunk.iter_mut().map(Copy::refresh).sum::<usize>();
+                            (bytes, WAITED.get())
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .fold((0, 0), |(b, w), (b2, w2)| (b + b2, w + w2))
+            })
+        };
+        refresh(&mut copies);
+        if armed {
+            for copy in &copies {
+                copy.tracked.arm(copy.start, copy.end());
+            }
+        }
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        // Per round: refresh ms, ms the writers spent in their writes,
+        // writes over 5 us, their mean us, the longest us, MB copied, ms the
+        // writers and the refresh waited for the guard lock.
+        let mut rows: Vec<[f64; 8]> = Vec::new();
+        for round in 0..=rounds {
+            // The frame before: `dirty` distinct pages written.
+            let mut all: Vec<usize> = (0..pages).collect();
+            for i in (1..all.len()).rev() {
+                all.swap(i, rng.next() as usize % (i + 1));
+            }
+            std::thread::scope(|s| {
+                for part in all[..dirty].chunks(dirty.div_ceil(writers).max(1)) {
+                    s.spawn(move || {
+                        for &page in part {
+                            let word = at + page * PAGE + 8 * (page % 1000);
+                            // SAFETY: a word of the pool; guarded, the
+                            // handler opens it.
+                            unsafe { (word as *mut u64).write_volatile(round as u64) };
+                        }
+                    });
+                }
+            });
+            // The refresh, with the writers writing on.
+            let stop = AtomicBool::new(false);
+            let (ms, bytes, spent) = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..writers)
+                    .map(|k| {
+                        let stop = &stop;
+                        s.spawn(move || {
+                            let mut rng = Rng(0x1234_5678 + (k * 77 + round) as u64);
+                            let (mut total, mut slow, mut slow_us, mut longest) =
+                                (0f64, 0u64, 0f64, 0f64);
+                            while !stop.load(Ordering::Relaxed) {
+                                let word = at + rng.next() as usize % (len / 8) * 8;
+                                let started = std::time::Instant::now();
+                                // SAFETY: a word of the pool; guarded, the
+                                // handler opens it.
+                                unsafe { (word as *mut u64).write_volatile(round as u64) };
+                                let us = started.elapsed().as_secs_f64() * 1e6;
+                                total += us;
+                                if us > 5.0 {
+                                    slow += 1;
+                                    slow_us += us;
+                                }
+                                longest = longest.max(us);
+                                let pause = std::time::Instant::now();
+                                while (pause.elapsed().as_micros() as u64) < gap {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                            (total, slow, slow_us, longest, WAITED.get())
+                        })
+                    })
+                    .collect();
+                let _stop = Stop(&stop);
+                let started = std::time::Instant::now();
+                let bytes = refresh(&mut copies);
+                let ms = started.elapsed().as_secs_f64() * 1e3;
+                stop.store(true, Ordering::Relaxed);
+                let spent: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                (ms, bytes, spent)
+            });
+            if round == 0 {
+                // Warming up.
+                continue;
+            }
+            let (bytes, refresh_waited) = bytes;
+            let writers_waited: u64 = spent.iter().map(|s| s.4).sum();
+            let total: f64 = spent.iter().map(|s| s.0).sum();
+            let slow: u64 = spent.iter().map(|s| s.1).sum();
+            let slow_us: f64 = spent.iter().map(|s| s.2).sum();
+            let longest = spent.iter().map(|s| s.3).fold(0f64, f64::max);
+            rows.push([
+                ms,
+                total / 1e3,
+                slow as f64,
+                if slow > 0 { slow_us / slow as f64 } else { 0.0 },
+                longest,
+                bytes as f64 / 1e6,
+                writers_waited as f64 / 1e3,
+                refresh_waited as f64 / 1e3,
+            ]);
+        }
+        let m = |i: usize| median(rows.iter().map(|r| r[i]).collect());
+        println!(
+            "{pages} pages, copies of {span}, {dirty} dirty, {writers} writers every {gap} us, wide {wide}, aliased {aliased}, armed {armed}, {rounds} rounds (medians)"
+        );
+        println!(
+            "refresh {:.2} ms ({:.1} MB), writers in their writes {:.2} ms (waiting for the guard lock {:.2} ms), {:.0} writes over 5 us at {:.1} us each, longest {:.0} us; the refresh waited {:.2} ms",
+            m(0),
+            m(5),
+            m(1),
+            m(6),
+            m(2),
+            m(3),
+            m(4),
+            m(7)
+        );
+        println!(
+            "guard_contention: refresh_ms={:.3} writes_ms={:.3} writers_wait_ms={:.3} slow={:.0} slow_us={:.2} longest_us={:.0} mb={:.1} refresh_wait_ms={:.3}",
+            m(0),
+            m(1),
+            m(6),
+            m(2),
+            m(3),
+            m(4),
+            m(5),
+            m(7)
+        );
     }
 }
