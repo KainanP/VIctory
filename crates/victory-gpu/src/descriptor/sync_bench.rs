@@ -379,3 +379,451 @@ fn sync_contention_bench() {
     crate::watch::tests::free(buffer);
     crate::watch::tests::free(memory);
 }
+
+/// One heap shaped as the title's world heap for the slot-level benches
+/// below: a placed, write-watched view heap of `slots` slots, every slot
+/// holding a record from `pool` and made once, a 1 MiB buffer the views
+/// view, and the records the benches copy in.
+struct Shape {
+    h: This,
+    memory: usize,
+    buffer: usize,
+    pool: Vec<([u8; 32], u64)>,
+    expected: Vec<u64>,
+    mirrored: usize,
+}
+
+impl Shape {
+    fn new(slots: usize) -> Shape {
+        let page = crate::watch::PAGE;
+        let memory = crate::watch::tests::pool(slots * 32 / page);
+        const BUFFER: usize = 16;
+        let buffer = crate::watch::tests::pool(BUFFER);
+        crate::shadow::register(buffer, buffer as u64, (BUFFER * page) as u64);
+        let addresses = (BUFFER * page / 16 - 16) as u64;
+        let address = |k: u64| buffer as u64 + 16 * (k % addresses);
+        let ext = Extended(
+            HeapDesc {
+                kind: VIEWS_KIND,
+                count: slots as u32,
+                flags: SHADER_VISIBLE,
+                nodes: 1,
+            },
+            Placement {
+                address: memory as u64,
+                size: (slots * 32) as u64,
+            },
+        );
+        let mut h: This = std::ptr::null();
+        assert_eq!(create_heap(std::ptr::null(), &ext.0, &HEAP_IIDS[0], &mut h), S_OK);
+        let host = heap(h).host().expect("a host view heap");
+        assert!(host.view_addresses().is_some(), "view addresses");
+        let mirrored = (host.count() as usize).min(slots);
+        // One in eight a null shader resource view, one in eight a constant
+        // buffer view, the rest buffer views at distinct addresses.
+        let pool: Vec<([u8; 32], u64)> = (0..65_536u64)
+            .map(|k| {
+                let mut slot = [0u8; 32];
+                let at = slot.as_mut_ptr() as u64;
+                let entry = match k % 8 {
+                    0 => {
+                        create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), at);
+                        0
+                    }
+                    4 => {
+                        create_cbv(std::ptr::null(), &[(k as u32) << 8, 6, 256, 0], at);
+                        0
+                    }
+                    _ => {
+                        buffer_view(address(k * 7), at);
+                        address(k * 7)
+                    }
+                };
+                (slot, entry)
+            })
+            .collect();
+        let mut shape = Shape { h, memory, buffer, pool, expected: vec![0; mirrored], mirrored };
+        for slot in 0..slots {
+            shape.put(slot, slot.wrapping_mul(7));
+        }
+        sync_heaps();
+        assert_eq!(shape.wrong(), 0, "slots without their view after the first sync");
+        shape
+    }
+
+    fn host(&self) -> &host::HostHeap {
+        heap(self.h).host().expect("a host view heap")
+    }
+
+    /// The record bytes in `slot`.
+    fn bytes(&self, slot: usize) -> [u8; 32] {
+        // SAFETY: `slot` is inside the heap.
+        unsafe { ((self.memory + slot * 32) as *const [u8; 32]).read_unaligned() }
+    }
+
+    /// Copies pool record `record` into `slot` as the title does (bytes).
+    fn put(&mut self, slot: usize, record: usize) {
+        let (bytes, entry) = &self.pool[record % self.pool.len()];
+        // SAFETY: `slot` is inside the heap.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (self.memory + slot * 32) as *mut u8, 32) };
+        if slot < self.expected.len() {
+            self.expected[slot] = *entry;
+        }
+    }
+
+    /// Slots whose view address is not their record's.
+    fn wrong(&self) -> usize {
+        let host = self.host();
+        (0..self.mirrored)
+            .filter(|&s| host.address_at(s as u32) != Some(self.expected[s]))
+            .count()
+    }
+}
+
+impl Drop for Shape {
+    fn drop(&mut self) {
+        assert_eq!(release(self.h), 0);
+        crate::shadow::unregister(self.buffer, self.buffer as u64);
+        crate::watch::tests::free(self.buffer);
+        crate::watch::tests::free(self.memory);
+    }
+}
+
+/// What [`with_title_threads`] measured: the title threads' waiting per
+/// frame (each call's time past the median with no frame running), median
+/// over the frames from `warm`; the uncontended call; and each written
+/// slot's last view address.
+struct Title {
+    wait_ms: f64,
+    base_us: f64,
+    last: Vec<(usize, u64)>,
+}
+
+/// `threads` title threads writing a buffer view every `work` into slots
+/// of their own (`own` each, from slot `first` of the heap at `memory`,
+/// viewing the buffer at `buffer`) while `body` runs. `body` gets a frame
+/// setter: `Some(frame)` while a frame's timed part runs, `None` otherwise.
+#[allow(clippy::too_many_arguments)] // a bench's knobs
+fn with_title_threads<R>(
+    memory: usize,
+    buffer: usize,
+    threads: usize,
+    first: usize,
+    own: usize,
+    work: Duration,
+    warm: usize,
+    body: impl FnOnce(&dyn Fn(Option<usize>)) -> R,
+) -> (R, Title) {
+    let buffer = buffer as u64;
+    let title_address = move |t: usize, n: u64| buffer + 16 * ((n * 5 + t as u64 * 7919) % 60_000);
+    let frame_now = AtomicUsize::new(usize::MAX);
+    let stop = AtomicBool::new(false);
+    let (r, samples, written) = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                let (frame_now, stop) = (&frame_now, &stop);
+                s.spawn(move || {
+                    let mut samples: Vec<(usize, u32)> = Vec::with_capacity(1 << 20);
+                    let mut n = 0u64;
+                    while !stop.load(Relaxed) {
+                        let frame = frame_now.load(Relaxed);
+                        let slot = first + t * own + (n % own as u64) as usize;
+                        let at = Instant::now();
+                        buffer_view(title_address(t, n), (memory + slot * 32) as u64);
+                        samples.push((frame, at.elapsed().as_nanos().min(u32::MAX as u128) as u32));
+                        n += 1;
+                        spin(work);
+                    }
+                    (samples, n)
+                })
+            })
+            .collect();
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Relaxed);
+            }
+        }
+        let stopping = Stop(&stop);
+        if threads > 0 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let r = body(&|f: Option<usize>| frame_now.store(f.unwrap_or(usize::MAX), Relaxed));
+        drop(stopping);
+        let mut all = Vec::new();
+        let mut written = Vec::new();
+        for (t, w) in workers.into_iter().enumerate() {
+            let (samples, n) = w.join().unwrap();
+            all.extend(samples);
+            written.push((t, n));
+        }
+        (r, all, written)
+    });
+    let mut base: Vec<f64> = samples.iter().filter(|s| s.0 == usize::MAX).map(|s| f64::from(s.1)).collect();
+    let base_ns = median(&mut base);
+    let frames = samples.iter().filter(|s| s.0 != usize::MAX).map(|s| s.0 + 1).max().unwrap_or(0);
+    let mut waits = vec![0f64; frames];
+    for &(f, ns) in &samples {
+        if f != usize::MAX {
+            waits[f] += (f64::from(ns) - base_ns).max(0.0) / 1e6;
+        }
+    }
+    let mut waits: Vec<f64> = waits.into_iter().skip(warm).collect();
+    let last = written
+        .iter()
+        .flat_map(|&(t, n)| {
+            (n.saturating_sub(own as u64)..n)
+                .map(move |k| (first + t * own + (k % own as u64) as usize, title_address(t, k)))
+        })
+        .collect();
+    (r, Title { wait_ms: median(&mut waits), base_us: base_ns / 1e3, last })
+}
+
+fn xorshift(mut next: u64) -> impl FnMut() -> usize {
+    move || {
+        next ^= next << 13;
+        next ^= next >> 7;
+        next ^= next << 17;
+        next as usize
+    }
+}
+
+fn spread(v: &[f64]) -> (f64, f64) {
+    (v.iter().copied().fold(f64::MAX, f64::min), v.iter().copied().fold(0.0, f64::max))
+}
+
+/// `HostHeap::sync_slots` in the shape #3425 reports (18.1 ms/frame for
+/// ~384,000 slots on an RTX 5090): each frame `SYNC_SLOTS_SLOTS` (393,216 =
+/// 192 pages) slots of a 2^20-slot view heap are in pages written since the
+/// last sync, `SYNC_SLOTS_STALE` records among them changed, and one
+/// `sync_heaps` runs (`SYNC_SLOTS_DIRECT=1`: `sync_slots` of each page
+/// instead, without the write-watch walk). A row for each stale count in
+/// `SYNC_SLOTS_STALE` (comma list, default 0,9600,96000), each without and
+/// with `SYNC_BENCH_THREADS` (5) title threads writing views every 20 us.
+/// Checks the changed slots after each sync and every slot at the end.
+///
+/// `cargo test -p victory-gpu --release sync_slots_bench -- --ignored
+/// --nocapture --test-threads=1`
+#[test]
+#[ignore = "a benchmark: needs a D3D12 adapter and a quiet machine"]
+fn sync_slots_bench() {
+    if crate::host::host().is_none() {
+        eprintln!("sync_slots_bench: no host D3D12 device");
+        return;
+    }
+    let slots = env("SYNC_BENCH_SLOTS", 1 << 20);
+    let dirty = env("SYNC_SLOTS_SLOTS", 393_216);
+    let frames = env("SYNC_BENCH_FRAMES", 20);
+    let threads = env("SYNC_BENCH_THREADS", 5);
+    let work = Duration::from_micros(env("SYNC_BENCH_WORK_US", 20) as u64);
+    let direct = env("SYNC_SLOTS_DIRECT", 0) != 0;
+    let stales: Vec<usize> = std::env::var("SYNC_SLOTS_STALE")
+        .unwrap_or_else(|_| "0,9600,96000".into())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    const WARM: usize = 3;
+    const OWN_PAGES: usize = 4;
+    let per_page = crate::watch::PAGE / 32;
+    let mut shape = Shape::new(slots);
+    let heap_pages = shape.mirrored / per_page;
+    let shared_pages = heap_pages - threads * OWN_PAGES;
+    let pages = (dirty / per_page).min(shared_pages);
+    let first_own = shared_pages * per_page;
+    let start = shape.memory as u64;
+    let (memory, buffer) = (shape.memory, shape.buffer);
+    let mut rand = xorshift(0x9E37_79B9_7F4A_7C15);
+    let what = if direct { "sync_slots" } else { "sync_heaps" };
+    let mut lost = 0usize;
+    for &stale in &stales {
+        for n_threads in [0, threads] {
+            let ((mut sync_ms, mut seen), title) =
+                with_title_threads(memory, buffer, n_threads, first_own, OWN_PAGES * per_page, work, WARM, |frame| {
+                    let (mut sync_ms, mut seen) = (Vec::new(), Vec::new());
+                    for f in 0..frames + WARM {
+                        // Distinct random pages among the shared ones.
+                        let mut chosen: Vec<usize> = Vec::with_capacity(pages);
+                        let mut taken = vec![false; shared_pages];
+                        while chosen.len() < pages {
+                            let p = rand() % shared_pages;
+                            if !std::mem::replace(&mut taken[p], true) {
+                                chosen.push(p);
+                            }
+                        }
+                        chosen.sort_unstable();
+                        // Every chosen page written (the title copying its
+                        // tables in), `stale` records among them changed.
+                        for &p in &chosen {
+                            // SAFETY: inside the heap.
+                            unsafe {
+                                let at = (memory + p * per_page * 32) as *mut u8;
+                                for k in (0..crate::watch::PAGE).step_by(4096) {
+                                    at.add(k).write_volatile(at.add(k).read_volatile());
+                                }
+                            }
+                        }
+                        let mut changed = Vec::with_capacity(stale);
+                        for _ in 0..stale {
+                            let slot = chosen[rand() % pages] * per_page + rand() % per_page;
+                            let mut r = rand();
+                            while shape.pool[r % shape.pool.len()].0 == shape.bytes(slot) {
+                                r = rand();
+                            }
+                            shape.put(slot, r);
+                            changed.push(slot);
+                        }
+                        frame(Some(f));
+                        let at = Instant::now();
+                        if direct {
+                            let host = shape.host();
+                            for &p in &chosen {
+                                host.sync_slots((p * per_page) as u32, ((p + 1) * per_page) as u32, start, 32);
+                            }
+                        } else {
+                            sync_heaps();
+                        }
+                        let took = at.elapsed();
+                        frame(None);
+                        changed.sort_unstable();
+                        changed.dedup();
+                        let host = shape.host();
+                        lost += changed
+                            .iter()
+                            .filter(|&&s| host.address_at(s as u32) != Some(shape.expected[s]))
+                            .count();
+                        if f >= WARM {
+                            sync_ms.push(took.as_secs_f64() * 1e3);
+                            seen.push(changed.len() as f64);
+                        }
+                    }
+                    (sync_ms, seen)
+                });
+            for &(s, a) in &title.last {
+                shape.expected[s] = a;
+            }
+            let (min, max) = spread(&sync_ms);
+            println!(
+                "sync_slots_bench: {what}, {} slots/frame in {pages} pages, {:.0} changed, {n_threads} title threads: \
+                 median {:.2} ms (min {min:.2}, max {max:.2}); title wait {:.2} ms/frame (uncontended write {:.2} us); lost {lost}",
+                pages * per_page,
+                median(&mut seen),
+                median(&mut sync_ms),
+                title.wait_ms,
+                title.base_us,
+            );
+        }
+    }
+    sync_heaps();
+    let stale_end = shape.wrong();
+    println!("sync_slots_bench: lost after a sync {lost}, stale at the end {stale_end}");
+    assert_eq!(lost, 0, "changed slots without their view after the sync");
+    assert_eq!(stale_end, 0, "slots without their last view");
+}
+
+/// The title's descriptor copies (`CopyDescriptorsSimple` into its
+/// shader-visible heap; borosf's "heap slots the title copied", 493,568
+/// slots/frame on Arc, 36.6 ms): each frame `SYNC_COPY_SLOTS` (393,216)
+/// slots copied in runs of `SYNC_COPY_RUN` (comma list, default 1,8,64,1024)
+/// to random places of a 2^20-slot view heap, from random records
+/// (`SYNC_COPY_SAME=1`: the records the slots hold already). Rows without
+/// and with `SYNC_BENCH_THREADS` (5) title threads writing views. Checks
+/// every slot after each row.
+///
+/// `cargo test -p victory-gpu --release copy_simple_bench -- --ignored
+/// --nocapture --test-threads=1`
+#[test]
+#[ignore = "a benchmark: needs a D3D12 adapter and a quiet machine"]
+fn copy_simple_bench() {
+    if crate::host::host().is_none() {
+        eprintln!("copy_simple_bench: no host D3D12 device");
+        return;
+    }
+    let slots = env("SYNC_BENCH_SLOTS", 1 << 20);
+    let total = env("SYNC_COPY_SLOTS", 393_216);
+    let frames = env("SYNC_BENCH_FRAMES", 10);
+    let threads = env("SYNC_BENCH_THREADS", 5);
+    let work = Duration::from_micros(env("SYNC_BENCH_WORK_US", 20) as u64);
+    let same = env("SYNC_COPY_SAME", 0) != 0;
+    let runs: Vec<usize> = std::env::var("SYNC_COPY_RUN")
+        .unwrap_or_else(|_| "1,8,64,1024".into())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    const WARM: usize = 2;
+    const OWN_PAGES: usize = 4;
+    let per_page = crate::watch::PAGE / 32;
+    let mut shape = Shape::new(slots);
+    let first_own = (shape.mirrored / per_page - threads * OWN_PAGES) * per_page;
+    let (memory, buffer) = (shape.memory, shape.buffer);
+    let mut rand = xorshift(0x2545_F491_4F6C_DD1D);
+    for &run in &runs {
+        for n_threads in [0, threads] {
+            let mut source = vec![[0u8; 32]; total];
+            let ((mut copy_ms, copied), title) =
+                with_title_threads(memory, buffer, n_threads, first_own, OWN_PAGES * per_page, work, WARM, |frame| {
+                    let mut copy_ms = Vec::new();
+                    let mut placed: Vec<(usize, usize)> = Vec::with_capacity(total);
+                    for f in 0..frames + WARM {
+                        // Where each run goes (below the title threads'
+                        // pages), and the records it carries.
+                        placed.clear();
+                        let mut k = 0;
+                        while k < total {
+                            let n = run.min(total - k);
+                            let at = rand() % (first_own - n);
+                            for j in 0..n {
+                                if same {
+                                    source[k + j] = shape.bytes(at + j);
+                                    placed.push((at + j, usize::MAX));
+                                } else {
+                                    let record = rand();
+                                    source[k + j] = shape.pool[record % shape.pool.len()].0;
+                                    placed.push((at + j, record));
+                                }
+                            }
+                            k += n;
+                        }
+                        frame(Some(f));
+                        let started = Instant::now();
+                        let mut k = 0;
+                        while k < total {
+                            let n = run.min(total - k);
+                            copy_simple(
+                                std::ptr::null(),
+                                n as u32,
+                                (memory + placed[k].0 * 32) as u64,
+                                source[k..].as_ptr() as u64,
+                                VIEWS_KIND,
+                            );
+                            k += n;
+                        }
+                        let took = started.elapsed();
+                        frame(None);
+                        if f >= WARM {
+                            copy_ms.push(took.as_secs_f64() * 1e3);
+                        }
+                        for &(slot, record) in placed.iter().filter(|p| p.1 != usize::MAX) {
+                            shape.expected[slot] = shape.pool[record % shape.pool.len()].1;
+                        }
+                    }
+                    (copy_ms, placed.len())
+                });
+            for &(s, a) in &title.last {
+                shape.expected[s] = a;
+            }
+            // The copies make the slots themselves: no sync before the check.
+            let wrong = shape.wrong();
+            let (min, max) = spread(&copy_ms);
+            println!(
+                "copy_simple_bench: {copied} slots/frame in runs of {run}{}, {n_threads} title threads: \
+                 copies median {:.2} ms (min {min:.2}, max {max:.2}); title wait {:.2} ms/frame (uncontended write {:.2} us); wrong {wrong}",
+                if same { " (same records)" } else { "" },
+                median(&mut copy_ms),
+                title.wait_ms,
+                title.base_us,
+            );
+            assert_eq!(wrong, 0, "slots without the view copied there");
+        }
+    }
+    sync_heaps();
+}
