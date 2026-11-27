@@ -50,7 +50,7 @@ type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
 #[derive(Default)]
 struct Inner {
-    slots: HashMap<u32, Seen>,
+    slots: Slots,
     /// How many slots view each range (no order needed: a hash map is one
     /// lookup where the tree was a descent through the world's ~130,000).
     ranges: HashMap<Range, u32>,
@@ -66,6 +66,52 @@ struct Inner {
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
     ends: HashMap<(usize, bool), Ends>,
+}
+
+/// What each slot sees, by slot index, in pages of [`Slots::PAGE`] made
+/// as slots in them are first set: one access a slot where a hash map of
+/// the world's ~600,000 slots (a table of 2^20 buckets) cost ~290 ns per
+/// insert, its probes missing the caches (sync_slots_bench). Smaller than
+/// that map once a heap's slots are mostly set; pages no slot is set in
+/// take nothing.
+#[derive(Default)]
+struct Slots {
+    pages: Vec<Option<Box<[Option<Seen>]>>>,
+}
+
+impl Slots {
+    const PAGE: usize = 1024;
+
+    /// Slot `index` sees `seen` now: what it saw before.
+    fn insert(&mut self, index: u32, seen: Seen) -> Option<Seen> {
+        let (page, at) = (index as usize / Self::PAGE, index as usize % Self::PAGE);
+        if self.pages.len() <= page {
+            self.pages.resize_with(page + 1, || None);
+        }
+        let page = self.pages[page].get_or_insert_with(|| std::iter::repeat_with(|| None).take(Self::PAGE).collect());
+        page[at].replace(seen)
+    }
+
+    /// Slot `index` sees nothing now: what it saw before.
+    fn remove(&mut self, index: u32) -> Option<Seen> {
+        let (page, at) = (index as usize / Self::PAGE, index as usize % Self::PAGE);
+        self.pages.get_mut(page)?.as_mut()?[at].take()
+    }
+
+    /// Keeps what slots see where `keep` says so.
+    fn retain(&mut self, mut keep: impl FnMut(&Seen) -> bool) {
+        for slot in self.pages.iter_mut().flatten().flat_map(|p| p.iter_mut()) {
+            if slot.as_ref().is_some_and(|s| !keep(s)) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// What the slots see.
+    #[cfg(feature = "diagnostics")]
+    fn values(&self) -> impl Iterator<Item = &Seen> {
+        self.pages.iter().flatten().flat_map(|p| p.iter().flatten())
+    }
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
@@ -100,7 +146,7 @@ impl Inner {
                 self.count(&seen, true);
                 self.slots.insert(index, seen)
             }
-            None => self.slots.remove(&index),
+            None => self.slots.remove(index),
         };
         if let Some(old) = old {
             self.count(&old, false);
@@ -399,7 +445,7 @@ pub(crate) fn forget(resource: usize) {
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.textures.remove(&resource).is_some() {
-            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
+            inner.slots.retain(|seen| !matches!(seen, Seen::Texture(r) if *r == resource));
         }
     }
 }
@@ -589,6 +635,37 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     const LINEAR: u32 = 0x100;
+
+    /// Slots are set, replaced, cleared and filtered by index across pages,
+    /// a far one without the pages before it holding anything.
+    #[test]
+    fn slots_keep_what_each_index_sees() {
+        let mut slots = Slots::default();
+        let texture = |r: usize| Seen::Texture(r);
+        let sees = |slots: &mut Slots, i: u32| {
+            let seen = slots.remove(i);
+            let r = seen.as_ref().map(|s| match s {
+                Seen::Texture(r) => *r,
+                _ => usize::MAX,
+            });
+            if let Some(seen) = seen {
+                slots.insert(i, seen);
+            }
+            r
+        };
+        assert!(slots.remove(5).is_none(), "nothing set yet");
+        assert!(slots.insert(1023, texture(1)).is_none());
+        assert!(slots.insert(1024, texture(2)).is_none());
+        assert!(slots.insert(1 << 20, texture(3)).is_none());
+        assert!(matches!(slots.insert(1023, texture(4)), Some(Seen::Texture(1))), "replaced: the old one back");
+        assert_eq!(slots.pages.iter().filter(|p| p.is_some()).count(), 3, "pages only where slots were set");
+        assert_eq!((sees(&mut slots, 1023), sees(&mut slots, 1024), sees(&mut slots, 1 << 20)), (Some(4), Some(2), Some(3)));
+        assert_eq!(sees(&mut slots, 1022), None);
+        slots.retain(|s| !matches!(s, Seen::Texture(2)));
+        assert_eq!((sees(&mut slots, 1023), sees(&mut slots, 1024), sees(&mut slots, 1 << 20)), (Some(4), None, Some(3)));
+        assert!(matches!(slots.remove(1 << 20), Some(Seen::Texture(3))));
+        assert!(slots.remove(1 << 20).is_none() && slots.remove(1 << 21).is_none());
+    }
 
     /// A copy's hull is its live ranges' first start to last end, kept as
     /// slots come and go; a copy no slot views any more has none.
